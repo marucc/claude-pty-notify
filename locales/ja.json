@@ -1,0 +1,5 @@
+{
+  "waiting": "{session} 入力待ち",
+  "permission": "{session} 許可待ち",
+  "question": "{session} 回答待ち"
+}

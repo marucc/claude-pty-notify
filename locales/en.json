@@ -1,0 +1,5 @@
+{
+  "waiting": "{session} is waiting for input",
+  "permission": "{session} needs permission",
+  "question": "{session} is waiting for an answer"
+}
