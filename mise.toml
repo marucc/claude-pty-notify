@@ -1,0 +1,3 @@
+[tasks.quality-gate]
+description = "型チェックとテストを実行する（claude-ship gate から呼ばれる）"
+run = "npm run typecheck && npm test"
