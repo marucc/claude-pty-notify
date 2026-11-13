@@ -6,6 +6,7 @@
  * When the title switches to ✳ (waiting), sends a notification to the terminal via OSC 777.
  * A ✳ state showing a permission or question dialog is shown with PERMISSION_MARKER until the user responds.
  * While unfocused, rewrites the title of an unacknowledged waiting state to UNREAD_MARKER.
+ * An interactive session also serves a Unix socket (input-socket.ts) that other processes use to type into it.
  */
 
 import { spawnSync } from "node:child_process";
@@ -17,6 +18,10 @@ import { resolveMessages, formatMessage, unreadMarker, permissionMarker } from "
 import { promptKind, type PromptKind } from "./permission.ts";
 import { isResponseInput } from "./input.ts";
 import { splitTrailingEscape } from "./escape.ts";
+import { childEnv, loadInputConfig } from "./input-config.ts";
+import { InputSocket } from "./input-socket.ts";
+import { SendGuard } from "./send-guard.ts";
+import { isPrintMode, parseSessionArgs } from "./session-args.ts";
 
 // OSC 0/2 title sequence: \x1b]0;TITLE\x07 or \x1b]0;TITLE\x1b\\
 const OSC_TITLE_RE = /\x1b\](?:0|2);([^\x07\x1b]*?)(?:\x07|\x1b\\)/g;
@@ -107,6 +112,24 @@ let blockingPrompt: PromptKind | null = null;
 let recentOutput = "";
 // Timer that decides the kind of the current ✳ state
 let decisionTimer: NodeJS.Timeout | null = null;
+// Last time Claude produced output (reported by the input socket)
+let lastOutputAt: number | null = null;
+
+// Settings of the input socket; invalid values warn and fall back to defaults
+const inputConfig = loadInputConfig(process.env, warnInput);
+// Prompt knowledge used to decide whether the input socket may write
+const sendGuard = new SendGuard(inputConfig);
+
+function warnInput(message: string): void {
+  process.stderr.write(`claude-pty-notify: ${message}\n`);
+}
+
+// State reported by the input socket. Priority: starting > permission / question > waiting > working
+function currentState(): string {
+  if (!childReady) return "starting";
+  if (blockingPrompt) return blockingPrompt;
+  return lastClaudeTitle.startsWith(WAITING_MARKER) ? "waiting" : "working";
+}
 
 // Build an OSC title sequence
 function oscTitle(title: string): string {
@@ -136,6 +159,7 @@ function decideWaitingKind(): void {
   blockingPrompt = promptKind(recentOutput);
   dbg(`decide: prompt=${blockingPrompt}`);
   if (blockingPrompt) {
+    sendGuard.dialogDetected(Date.now());
     process.stdout.write(oscTitle(displayTitle(lastClaudeTitle)));
   }
 
@@ -192,6 +216,7 @@ function handleTitleChange(title: string): void {
     recentOutput = "";
     blockingPrompt = null;
     cancelDecision();
+    sendGuard.dialogEnded();
   }
 
   // non-✳ → ✳ transition = start of a new waiting episode
@@ -201,6 +226,7 @@ function handleTitleChange(title: string): void {
     // Dialogs are printed after the ✳ title; earlier output is Claude's reply,
     // which may itself contain "Do you want to ..."
     recentOutput = "";
+    sendGuard.dialogEnded();
     decisionTimer = setTimeout(decideWaitingKind, DECISION_DELAY_MS);
   }
   prevWasWaiting = isWaiting;
@@ -213,7 +239,7 @@ const child = (() => {
       cols: process.stdout.columns || 80,
       rows: process.stdout.rows || 24,
       cwd: process.cwd(),
-      env: { ...process.env, CLAUDE_PTY_WRAPPED: "1" },
+      env: { ...childEnv(process.env), CLAUDE_PTY_WRAPPED: "1" },
     });
   } catch (e) {
     console.error(`claude-pty-notify: failed to start ${claudeBin}: ${(e as Error).message}`);
@@ -260,6 +286,13 @@ child.onData((data) => {
   dbg(`stdout.write=${vis(output)}`);
   process.stdout.write(output);
 
+  lastOutputAt = Date.now();
+  sendGuard.observeOutput(text);
+  // A dialog text while the title says ✳ may be a dialog waiting for an answer, even after the decision was made
+  if (lastClaudeTitle.startsWith(WAITING_MARKER) && promptKind(recentOutput)) {
+    sendGuard.dialogDetected(lastOutputAt);
+  }
+
   // Switch to the permission marker as soon as the dialog shows up instead of waiting for the timer
   // (after writing the chunk, so its ✳ / unread title does not overwrite the marker)
   if (decisionTimer && promptKind(recentOutput)) {
@@ -271,8 +304,63 @@ child.onExit(({ exitCode, signal }) => {
   process.exit(exitCodeOf(exitCode, signal));
 });
 
+// Socket other processes use to type into this session (not created for -p / --print or CLAUDE_PTY_NO_INPUT=1)
+const inputSocket = inputConfig.disabled || isPrintMode(claudeArgs) ? null : (() => {
+  const { name, sessionId } = parseSessionArgs(claudeArgs);
+  return new InputSocket({
+    runDir: inputConfig.runDir,
+    name,
+    sessionId,
+    pid: process.pid,
+    startedAt: new Date(),
+    cwd: process.cwd(),
+    maxConnections: inputConfig.maxConnections,
+    connectionTimeoutMs: inputConfig.connectionTimeoutMs,
+    allowedCommands: inputConfig.allowedCommands,
+    host: {
+      info: () => ({
+        title: childReady ? lastClaudeTitle.replace(/^[✳✻✶✢✽·\u2800-\u28ff\s]+/u, "") : null,
+        state: currentState(),
+        dialogSuspected: sendGuard.isDialogSuspected(Date.now()),
+        draftSuspected: sendGuard.isDraftSuspected(),
+        lastOutputAt,
+        lastInputAt: sendGuard.lastInputAt,
+      }),
+      check: (recheck) => sendGuard.check({ starting: !childReady, deciding: decisionTimer !== null }, Date.now(), recheck),
+      write: (data) => child.write(data),
+      pasteStarted: (text) => sendGuard.pasteStarted(text),
+      pasteAborted: () => sendGuard.pasteAborted(),
+      // The pasted text echoes into recentOutput; drop it so its wording is not mistaken for a dialog later
+      pasteLeftover: () => {
+        sendGuard.pasteLeftover();
+        recentOutput = "";
+      },
+      sent: () => {
+        sendGuard.sent();
+        recentOutput = "";
+      },
+    },
+    // A failing log write must not take the wrapper down from a socket callback
+    log: (line) => {
+      try {
+        dbg(line);
+      } catch {
+        // ignore
+      }
+    },
+    warn: warnInput,
+  });
+})();
+inputSocket?.start().catch((e: Error) => warnInput(`input socket disabled: ${e.message}`));
+
 // Turn off the focus reporting enabled below, or the shell keeps receiving ^[[I / ^[[O after exit
 process.on("exit", () => {
+  // Remove the socket first: the terminal may be gone and the write below can throw
+  try {
+    inputSocket?.close();
+  } catch {
+    // the next start removes a leftover socket
+  }
   fs.writeSync(1, "\x1b[?1004l");
 });
 
@@ -311,7 +399,12 @@ process.stdin.on("data", (data: Buffer) => {
   }
 
   // Terminal replies, mouse events and arrow keys also arrive on stdin; only answering input counts
-  if (isResponseInput(str)) handleResponseInput();
+  // Keys typed while a dialog is up may be answers (digits) or may fill the input line; the guard sorts it out when the dialog ends
+  sendGuard.stdinData(str, blockingPrompt !== null || sendGuard.isDialogSuspected(Date.now()));
+  if (isResponseInput(str)) {
+    sendGuard.humanInput(Date.now());
+    handleResponseInput();
+  }
 
   // Forward focus events only after childReady (before that, the PTY echo prints ^[[I)
   const isFocusEvent = focusIn >= 0 || focusOut >= 0;
